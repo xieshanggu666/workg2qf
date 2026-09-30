@@ -293,8 +293,10 @@ const stats = computed(() => store.schedulingStats)
           <div class="dh-mode">
             <h3>🧠 动态调度引擎</h3>
             <p class="muted">
-              融合 <b>分时预约客流</b>（入园 + 热门设施预约，未来日按散客均值外推）、<b>在途检修工单</b>、<b>待处置投诉岗位</b>
-              三类需求，按早/中/晚/跨日夜班核算岗位缺口，自动智能补位；当天已开始班段的硬缺口转<b>紧急加班调令</b>走主管审批。
+              以「客流预测中心」融合的 <b>散客在园 + 散客分时预约 + 会员预约 + 领队团单 + 热门设施折算</b> 客流，
+              以及 <b>在途检修工单</b>、<b>待处置投诉岗位</b>（按 SLA/升级/严重度优先级）为需求，
+              按早/中/晚/跨日夜班核算岗位缺口并自动智能补位（含跨日夜班次日 9:00 交接覆盖）；
+              当天已开始班段的硬缺口转 <b>紧急加班调令</b> 走主管审批。
             </p>
           </div>
           <div class="dh-actions">
@@ -333,6 +335,8 @@ const stats = computed(() => store.schedulingStats)
       <div v-if="planDayData" class="card plan-card">
         <div class="plan-summary">
           <span>预测总客流 <b>{{ planDayData.demand.flowTotal }}</b> 人</span>
+          <span>预约合计 <b>{{ planDayData.demand.forecast?.reserved ?? 0 }}</b>（团单 {{ planDayData.demand.forecast?.groupReserved ?? 0 }} · 会员 {{ planDayData.demand.forecast?.memberReserved ?? 0 }}）</span>
+          <span>预测置信度 <b>{{ planDayData.demand.confidence }}%</b></span>
           <span>在途检修工单 <b :class="planDayData.demand.openOrders ? 'neg' : ''">{{ planDayData.demand.openOrders }}</b></span>
           <span>待处置投诉 <b :class="planDayData.demand.openComplaints ? 'neg' : ''">{{ planDayData.demand.openComplaints }}</b></span>
           <span>花名册 <b>{{ planDayData.rosterCount }}</b> 人</span>
@@ -345,6 +349,7 @@ const stats = computed(() => store.schedulingStats)
               <b>{{ BAND_META[b.key].icon }} {{ BAND_META[b.key].name }}</b>
               <em class="muted">{{ BAND_META[b.key].range }}</em>
               <span v-if="b.key === 'night'" class="tag">跨日</span>
+              <span v-if="b.priority" class="tag prio" :class="b.priority >= 70 ? 'urg' : b.priority >= 40 ? 'high' : ''">优先级 {{ b.priority }}</span>
             </div>
             <div class="band-flow muted">班段客流合计 {{ b.flow }} · 峰值 {{ b.peak }}</div>
             <div class="need-row" :class="b.gGuard.level">
@@ -363,10 +368,14 @@ const stats = computed(() => store.schedulingStats)
               <em>缺 {{ b.gRepair.gap }}</em>
             </div>
             <div v-if="b.orders.length" class="band-refs">
-              <em v-for="o in b.orders" :key="o.id" class="ref-order" :class="o.status">{{ o.code }} · {{ o.ride_name }}</em>
+              <em v-for="o in b.orders" :key="o.id" class="ref-order" :class="o.status">
+                {{ o.code }} · {{ o.ride_name }} · 优先级 {{ o.score }}
+              </em>
             </div>
             <div v-if="b.complaints.length" class="band-refs">
-              <em v-for="c in b.complaints" :key="c.id" class="ref-comp" :class="'sev'+c.severity">{{ c.code }} · {{ c.roles.join('/') }}</em>
+              <em v-for="c in b.complaints" :key="c.id" class="ref-comp" :class="'sev'+c.severity">
+                {{ c.code }} · {{ c.roles.join('/') }} · {{ c.urgency === 'urgent' ? '紧急' : c.urgency === 'high' ? '高优' : '一般' }}（{{ c.priority }}）
+              </em>
             </div>
             <div v-if="b.blockN" class="band-alert">⛔ {{ b.blockN }} 项硬缺岗（检修中/紧急投诉）</div>
             <div v-else-if="b.warnN" class="band-warn">⚠️ {{ b.warnN }} 项缺口</div>
@@ -648,8 +657,11 @@ const stats = computed(() => store.schedulingStats)
 .band-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
 .band-col { border: 1px solid var(--border); border-radius: 12px; padding: 12px; background: var(--panel2); display: flex; flex-direction: column; gap: 7px; }
 .band-col.blocked { border-color: rgba(255,107,107,.5); background: rgba(255,107,107,.06); }
-.band-head { display: flex; align-items: center; gap: 8px; }
+.band-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .band-head em { font-style: normal; font-size: 11px; }
+.tag.prio { background: rgba(255,209,102,.18); color: var(--accent2); border-color: rgba(255,209,102,.45); }
+.tag.prio.high { background: rgba(255,158,100,.18); color: #ff9e64; border-color: rgba(255,158,100,.5); }
+.tag.prio.urg { background: rgba(255,107,107,.18); color: var(--red); border-color: rgba(255,107,107,.55); }
 .band-flow { font-size: 11px; }
 .need-row { display: flex; justify-content: space-between; align-items: center; font-size: 13px; padding: 4px 8px; border-radius: 8px; background: rgba(255,255,255,.03); }
 .need-row b { font-weight: 600; }

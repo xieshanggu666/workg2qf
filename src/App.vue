@@ -11,6 +11,7 @@ import TicketView from '@/components/TicketView.vue'
 import MembersView from '@/components/MembersView.vue'
 import ReservationsView from '@/components/ReservationsView.vue'
 import GroupsView from '@/components/GroupsView.vue'
+import FlowForecastView from '@/components/FlowForecastView.vue'
 import EventsView from '@/components/EventsView.vue'
 import ComplaintsView from '@/components/ComplaintsView.vue'
 import ReportsView from '@/components/ReportsView.vue'
@@ -25,6 +26,7 @@ const navs = [
   { k: 'vendors', icon: '🏪', label: '商铺' },
   { k: 'staff', icon: '👷', label: '员工管理' },
   { k: 'scheduling', icon: '🗓️', label: '排班工时' },
+  { k: 'flow', icon: '🌦️', label: '客流预测' },
   { k: 'ticket', icon: '🎫', label: '票务定价' },
   { k: 'members', icon: '💎', label: '会员权益' },
   { k: 'reservations', icon: '📅', label: '预约调度' },
@@ -73,6 +75,7 @@ onMounted(store.refresh)
           <span class="halo" v-if="store.reservationStats.oversoldPending">⚠️ {{ store.reservationStats.oversoldPending }} 个超售时段待消化</span>
           <span class="halo" v-if="store.groupStats.pending">🧑‍✈️ {{ store.groupStats.pending }} 个团队待确认</span>
           <span class="halo red" v-if="store.groupStats.interrupted">🚧 {{ store.groupStats.interrupted }} 段团队行程停运待处置</span>
+          <span class="halo red" v-if="store.reconcile.driftCount">🧾 对账发现 {{ store.reconcile.driftCount }} 处状态漂移</span>
           <span class="halo" v-if="store.memberStats.expiring">💳 {{ store.memberStats.expiring }} 张会员卡即将到期</span>
         </div>
         <div class="stats">
@@ -90,6 +93,7 @@ onMounted(store.refresh)
         <VendorsView v-else-if="view === 'vendors'" />
         <StaffView v-else-if="view === 'staff'" />
         <SchedulingView v-else-if="view === 'scheduling'" />
+        <FlowForecastView v-else-if="view === 'flow'" />
         <TicketView v-else-if="view === 'ticket'" />
         <MembersView v-else-if="view === 'members'" />
         <ReservationsView v-else-if="view === 'reservations'" />

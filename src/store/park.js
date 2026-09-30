@@ -103,7 +103,11 @@ export const useParkStore = defineStore('park', {
     // 领队组团
     groups: s => s.data?.groups || [],
     groupStats: s => s.data?.groupStats || emptyGroupStats(),
-    groupConfig: s => s.data?.groupConfig || { enabled: 1, depositRate: 0.3, minQty: 5, maxQty: 120, days: 3, entryHours: [9, 10, 11, 12, 13, 14, 15, 16, 17, 18], rideHours: [9, 10, 11, 12, 13, 14, 15, 16, 17] }
+    groupConfig: s => s.data?.groupConfig || { enabled: 1, depositRate: 0.3, minQty: 5, maxQty: 120, days: 3, entryHours: [9, 10, 11, 12, 13, 14, 15, 16, 17, 18], rideHours: [9, 10, 11, 12, 13, 14, 15, 16, 17] },
+    // 统一客流预测与一致性对账
+    flowPlan: s => s.data?.flowPlan || { days: [], history: [], params: {}, accuracy: 0 },
+    flowStats: s => s.data?.flowStats || { todayTotal: 0, todayReserved: 0, todayWalkin: 0, tomorrowTotal: 0, peakHour: 0, pendingRefunds: 0 },
+    reconcile: s => s.data?.reconcile || { driftCount: 0, slotDrift: 0, activeSlotDrift: 0, stalePending: 0, pendingRefunds: 0, groupDrift: 0 }
   },
   actions: {
     async refresh() {
@@ -192,6 +196,11 @@ export const useParkStore = defineStore('park', {
     rerouteGroupItem(id, slot_id, request_id) { return this.api('POST', `/group-items/${id}/reroute`, { slot_id, request_id }) },
     refundOutageItem(id, request_id) { return this.api('POST', `/group-items/${id}/refund-outage`, { request_id }) },
     saveGroupConfig(payload) { return this.api('POST', '/group-config', payload) },
-    async groupDetail(id) { return j('GET', `/groups/${id}`) }
+    async groupDetail(id) { return j('GET', `/groups/${id}`) },
+    // 统一客流预测与一致性对账
+    async flowForecast() { return j('GET', '/flow-forecast') },
+    refreshFlowForecast() { return this.api('POST', '/flow-forecast/refresh', {}) },
+    async reconcileAudit() { return j('GET', '/reconcile') },
+    reconcileRepair(only) { return this.api('POST', '/reconcile/repair', only ? { only } : {}) }
   }
 })

@@ -28,7 +28,8 @@ import {
   requestOvertime, approveOvertime, rejectOvertime, cancelRequest,
   listSchedules, listAttendance, listRequests as listShiftRequests,
   shiftLogs, schedulingStats, coverageForDay, staffDutyState, writeWorkCompletion,
-  listShiftTemplates, demandForDay, dispatchPlan, runDynamicDispatch, maybeDispatchAfter
+  listShiftTemplates, demandForDay, dispatchPlan, runDynamicDispatch, maybeDispatchAfter,
+  scheduleDispatchOnInventoryChange
 } from './scheduling.js'
 import {
   initGroupContext, submitGroup, confirmGroup, rejectGroup, cancelGroup,
@@ -36,6 +37,13 @@ import {
   refundInterruptedItem, handleParkOutageGroupRows, refundGroupsByRide,
   autoSimulateGroup, autoGroupTick, listGroups, groupDetail, groupStats, GROUP_CONST
 } from './groups.js'
+import {
+  refreshForecasts, finalizeDayForecast, forecastPlan, forecastStats
+} from './flowForecast.js'
+import {
+  initReconcileContext, runAudit, repairAll, repairSlots, repairPendingRefunds,
+  repairGroups, reconcileStats, dayCloseAudit
+} from './reconcile.js'
 
 const app = express()
 app.use(express.json())
@@ -125,6 +133,15 @@ initGroupContext({
 // 预约停运联动 → 团行程重排/退款（同一事务内执行）
 initReservationContext({
   handleParkOutageGroup: (rows, info) => handleParkOutageGroupRows(rows, info)
+})
+
+// 一致性对账模块：经营异常事件登记（漂移告警/修复留痕），由各模块共用 events 表
+function logOperationalEvent(type, title, desc, impact = -1) {
+  db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+    .run(state.tick(), state.day(), type, title, desc, impact, 'active')
+}
+initReconcileContext({
+  logEvent: (type, title, desc, impact) => logOperationalEvent(type, title, desc, impact)
 })
 
 // ---------------- 分期贷款 ----------------
@@ -578,10 +595,17 @@ function tick() {
         .run(state.tick(), day, 'member', '会员卡集中到期',
           `日结扫描发现 ${expiredCards} 张会员卡已过有效期，已自动降级为普通会员（积分与储值余额保留）。会员专员可跟进续费转化。`, 0, 'resolved')
     }
+    // 统一客流预测闭环：回写上一营业日实际到园与开盘预测准确率，供后续日外推与调度复盘
+    try { finalizeDayForecast(day) } catch (e) { console.error('[flowForecast] 日结复盘失败（不影响日结）:', e) }
+    // 闭园一致性对账：库存计数/补退挂起/团账与单据事实比对，漂移则登记经营异常事件（不自动改资金）
+    try { dayCloseAudit(day) } catch (e) { console.error('[reconcile] 闭园对账失败（不影响日结）:', e) }
     day += 1
     setSetting('day', day)
   }
   setSetting('hour', hour)
+
+  // 统一客流预测：每营业小时滚动未来三天预测快照（散客+散约+会员+团单），作为动态调度的需求事实源
+  try { refreshForecasts() } catch (e) { console.error('[flowForecast] 预测刷新失败（不影响主循环）:', e) }
 
   // ---- 分时预约闭环 ----
   ensureSlots()                       // 维护未来三天的入园/设施时段库存
@@ -815,6 +839,9 @@ function checkBrokenDown(day) {
 // 兼容既有检修状态：为已停运检修但无在途工单的设施补建排队工单
 backfillMaintenanceOrders()
 
+// 统一客流预测：启动即生成今/明/后三天预测快照（动态调度事实源）
+try { refreshForecasts() } catch (e) { console.error('[flowForecast] 启动预测初始化失败:', e) }
+
 // 启动循环
 tick()
 setInterval(tick, TICK_MS)
@@ -897,6 +924,10 @@ app.get('/api/state', (req, res) => {
     schedulingStats: schedulingStats(),
     coverageToday: coverageForDay(state.day()),
     dispatchPlan: dispatchPlan({ horizon: 3 }),
+    // 统一客流预测与一致性对账闭环
+    flowPlan: forecastPlan({ horizon: 3, includeHistory: 5 }),
+    flowStats: forecastStats(),
+    reconcile: reconcileStats(),
     finance: fin,
     avgs: {
       satisfaction: computeSatisfaction(),
@@ -991,6 +1022,8 @@ app.post('/api/rides/:id', (req, res) => {
     console.error(`[rides] 设施 #${id} 状态变更联动失败，已整体回滚 [${req.reqId}]:`, e)
     return res.status(500).json({ ok: false, code: 'TX_FAILED', msg: '状态变更联动失败，本次操作未生效，请稍后重试', reqId: req.reqId })
   }
+  // 停运退款/重开时段改变了在途预约库存 → 刷新预测并节流触发调度重评估
+  if (b.status) afterInventoryChange({ ok: true })
   res.json({ ok: true })
 })
 
@@ -1013,6 +1046,7 @@ app.delete('/api/rides/:id', (req, res) => {
     console.error(`[rides] 设施 #${id} 拆除联动失败，已整体回滚 [${req.reqId}]:`, e)
     return res.status(500).json({ ok: false, code: 'TX_FAILED', msg: '拆除联动失败，本次操作未生效，请稍后重试', reqId: req.reqId })
   }
+  afterInventoryChange({ ok: true })
   res.json({ ok: true })
 })
 
@@ -1466,11 +1500,59 @@ app.get('/api/coverage/:day', (req, res) => {
   res.json({ coverage: coverageForDay(day), demand: demandForDay(day) })
 })
 
+// ---- 统一客流预测与资源调度闭环 ----
+// 预测计划（只读）：未来 3 天逐小时融合预测（散客/散约/会员/团单）+ 班段需求 + 历史准确率
+app.get('/api/flow-forecast', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    plan: forecastPlan({ horizon: num(q.horizon, 3) || 3, includeHistory: 5 }),
+    stats: forecastStats()
+  })
+})
+
+// 手动滚动一次预测快照（运营调整容量/票价/团单后立即可见最新预测）
+app.post('/api/flow-forecast/refresh', (req, res) => {
+  const r = refreshForecasts()
+  res.json({ ...r, plan: forecastPlan({ horizon: 3, includeHistory: 5 }) })
+})
+
+// 一致性对账：只读返回库存计数/补退挂起/团账与单据事实的全部漂移明细
+app.get('/api/reconcile', (req, res) => {
+  res.json({ audit: runAudit({}), stats: reconcileStats() })
+})
+
+// 一键受控修复：计数以单据为准重算、僵尸挂起作废、团账汇总对齐流水（不改任何资金/逐条流水）
+app.post('/api/reconcile/repair', (req, res) => {
+  const b = req.body || {}
+  let r
+  try {
+    // 各类修复内部各自独立事务、逐类容错；only 指定单类，便于运营先修一类再核对
+    if (b.only === 'slots') r = { slots: repairSlots({ requestId: idemKey(req) }) }
+    else if (b.only === 'pending') r = { pending: repairPendingRefunds() }
+    else if (b.only === 'groups') r = { groups: repairGroups() }
+    else r = repairAll()
+  } catch (e) {
+    console.error(`[reconcile] 修复失败已回滚 [${req.reqId}]:`, e)
+    return res.status(500).json({ ok: false, code: 'TX_FAILED', msg: '对账修复失败，已整体回滚，请稍后重试', reqId: req.reqId })
+  }
+  res.json({ ok: true, ...r, audit: runAudit({}), stats: reconcileStats(), reqId: req.reqId })
+})
+
 // ---- 分时预约：库存 / 下单 / 改签 / 取消 / 核销 ----
 // 幂等键：body.request_id 优先，兼容 X-Idempotency-Key 头；同一键重复请求返回首次结果
 const idemKey = req => String(req.body?.request_id || req.get('X-Idempotency-Key') || '').slice(0, 80)
 // 统一响应：附带服务端请求号，前端可展示「错误码 · 请求号」便于追踪
 const reply = (req, res, r, okStatus = 200) => res.status(r?.ok ? okStatus : 400).json({ ...r, reqId: req.reqId })
+
+// 预约/团单库存变化（下单/改签/取消/核销/锁名额/收款/退团/重排）成功后：
+// 统一客流预测事实随之变化，节流触发动态调度重评估（同 tick 只跑一次，失败不影响主操作）
+function afterInventoryChange(r) {
+  if (r?.ok) {
+    try { refreshForecasts() } catch { /* 预测刷新失败不阻塞 */ }
+    try { scheduleDispatchOnInventoryChange('预约/团单库存变化，客流需求重评估') } catch { /* 调度失败不阻塞 */ }
+  }
+  return r
+}
 
 // 查询时段库存（入园 entry / 设施 ride），可按日期与设施过滤
 app.get('/api/reservation-slots', (req, res) => {
@@ -1485,9 +1567,9 @@ app.get('/api/reservation-slots', (req, res) => {
   })
 })
 
-// 运营调度：调整时段容量 / 超售额度 / 开关时段
+// 运营调度：调整时段容量 / 超售额度 / 开关时段（关闭时段触发在途退款）
 app.post('/api/reservation-slots/:id', (req, res) => {
-  reply(req, res, updateSlot(num(req.params.id), req.body || {}))
+  reply(req, res, afterInventoryChange(updateSlot(num(req.params.id), req.body || {})))
 })
 
 // 预约列表（可按状态/类型/日期过滤）
@@ -1519,22 +1601,23 @@ app.post('/api/reservations', (req, res) => {
     benefitId: b.benefit_id ? num(b.benefit_id) : null,
     requestId: idemKey(req)
   })
+  afterInventoryChange(r)
   reply(req, res, r)
 })
 
 // 改签：目标时段有余量才可改，库存原子转移（幂等：重放不产生二次转移）
 app.post('/api/reservations/:id/reschedule', (req, res) => {
-  reply(req, res, rescheduleReservation(num(req.params.id), num(req.body?.slot_id), idemKey(req)))
+  reply(req, res, afterInventoryChange(rescheduleReservation(num(req.params.id), num(req.body?.slot_id), idemKey(req))))
 })
 
 // 取消：未开始全额退，当日取消退 50%，时段已过不可取消（幂等：重放不重复退款）
 app.post('/api/reservations/:id/cancel', (req, res) => {
-  reply(req, res, cancelReservation(num(req.params.id), idemKey(req)))
+  reply(req, res, afterInventoryChange(cancelReservation(num(req.params.id), idemKey(req))))
 })
 
 // 闸机 / 设施口扫码核销（幂等：重复扫码不重复放行）
 app.post('/api/reservations/:id/checkin', (req, res) => {
-  reply(req, res, checkinReservation(num(req.params.id), idemKey(req)))
+  reply(req, res, afterInventoryChange(checkinReservation(num(req.params.id), idemKey(req))))
 })
 
 // 预约详情时间线
@@ -1583,10 +1666,9 @@ app.post('/api/groups', (req, res) => {
     requestId: idemKey(req)
   }), 201)
 })
-
 // 运营确认：统一锁定各时段名额并收取订金（幂等）
 app.post('/api/groups/:id/confirm', (req, res) => {
-  reply(req, res, confirmGroup(num(req.params.id), { requestId: idemKey(req), staffId: num(req.body?.staff_id) || null }))
+  reply(req, res, afterInventoryChange(confirmGroup(num(req.params.id), { requestId: idemKey(req), staffId: num(req.body?.staff_id) || null })))
 })
 
 // 运营拒绝待确认团单
@@ -1610,25 +1692,25 @@ app.post('/api/groups/:id/balance', (req, res) => {
 
 // 分批核销某个行程（闸机入园 / 设施口；幂等）
 app.post('/api/group-items/:id/checkin', (req, res) => {
-  reply(req, res, checkinGroupItem(num(req.params.id), num(req.body?.qty, 1), {
+  reply(req, res, afterInventoryChange(checkinGroupItem(num(req.params.id), num(req.body?.qty, 1), {
     requestId: idemKey(req),
     source: req.body?.source === 'auto' ? 'auto' : 'manual'
-  }))
+  })))
 })
 
 // 领队部分退团（未来时段全额退已付部分；当日退扣 50% 手续费；幂等）
 app.post('/api/group-items/:id/refund', (req, res) => {
-  reply(req, res, refundGroupLeg(num(req.params.id), num(req.body?.qty, 1), { requestId: idemKey(req) }))
+  reply(req, res, afterInventoryChange(refundGroupLeg(num(req.params.id), num(req.body?.qty, 1), { requestId: idemKey(req) })))
 })
 
 // 停运挂起/在途行程重排到新时段（幂等）
 app.post('/api/group-items/:id/reroute', (req, res) => {
-  reply(req, res, rerouteGroupItem(num(req.params.id), num(req.body?.slot_id), { requestId: idemKey(req) }))
+  reply(req, res, afterInventoryChange(rerouteGroupItem(num(req.params.id), num(req.body?.slot_id), { requestId: idemKey(req) })))
 })
 
 // 停运挂起行程选择园方退款（幂等）
 app.post('/api/group-items/:id/refund-outage', (req, res) => {
-  reply(req, res, refundInterruptedItem(num(req.params.id), { requestId: idemKey(req) }))
+  reply(req, res, afterInventoryChange(refundInterruptedItem(num(req.params.id), { requestId: idemKey(req) })))
 })
 
 // 团队模块运营配置：订金比例 / 模块开关

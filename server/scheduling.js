@@ -1,4 +1,5 @@
 import db, { getSetting, setSetting, tx } from './db.js'
+import { forecastForDay } from './flowForecast.js'
 
 // 员工排班与工时结算模块：
 // 班次模板 → 排班（校验冲突/岗位覆盖）→ 考勤打卡（迟到/在岗/离岗）→ 调班/加班协作（主管审批）
@@ -521,8 +522,9 @@ export function cancelRequest(requestId, staffId) {
   })
 }
 
-// ---------------- 需求画像（预约客流 / 检修工单 / 投诉岗位 → 班段×岗位需求） ----------------
-// 班段 → 班次：早班/中班/晚班/跨日夜班；HOURS 为该班段在营业时段内覆盖的小时
+// ---------------- 需求画像（统一客流预测 / 检修工单 / 投诉岗位 → 班段×岗位需求） ----------------
+// 客流事实源统一来自 flowForecast（融合散客在园+散客预约+会员预约+团单名额+设施折算），
+// 排班不再自行另算一套，避免预约/会员/团单/排班口径不一致。
 const BANDS = [
   { key: 'morning', shift_code: 'morning', label: '早班', hours: [9, 10, 11] },
   { key: 'mid', shift_code: 'mid', label: '中班', hours: [12, 13] },
@@ -534,57 +536,55 @@ const ROLE_GROUP = { guard: GUARD_ROLE_SET, clean: ['保洁'], repair: ['维修'
 // 缺口对象中的角色名 → 角色数组
 const ROLES_BY_NAME = { '保安/安保': GUARD_ROLE_SET, '保洁': ['保洁'], '维修工': ['维修'] }
 
-// 历史散客均值（近 3 天每时段实际入园 - 预约核销入园），用于未来日客流预测；无历史时回落到基准值
-function avgWalkinByHour() {
-  const rows = db.prepare(`
-    SELECT hour,
-           AVG(count) avg_total,
-           AVG((SELECT COALESCE(SUM(r.qty),0) FROM reservations r
-                WHERE r.status='checked' AND r.scope='entry' AND r.slot_day=v.day AND r.slot_hour=v.hour)) avg_rsv
-    FROM visitors v
-    WHERE day BETWEEN ? AND ?
-    GROUP BY hour`).all(Math.max(1, ctx.day() - 3), ctx.day() - 1)
-  const map = new Map()
-  for (const r of rows) map.set(r.hour, Math.max(0, num(r.avg_total) - num(r.avg_rsv)))
-  return map
+// 优先级评分（分值越大越优先补位）：
+//  投诉 = 严重度基础分（一般 10 / 严重 30 / 紧急 60）+ 每次升级 +12 + SLA 剩余越少越急（0~30）+ 会员本人投诉小幅加权
+//  工单 = 排队 40（接单优先，早班消化）/ 检修中 55（在途设施持续停运）+ 进度越接近完工越优先（0~20，尽快恢复运营）
+//  返回 0~100+ 分值与可读紧迫度（urgent/high/normal）
+function complaintPriority(c) {
+  const sevBase = { 1: 10, 2: 30, 3: 60 }[c.severity] || 10
+  const escal = num(c.escalations, 0) * 12
+  const remain = Math.max(0, num(c.deadline_tick) - ctx.tick())
+  const sla = c.severity === 3 ? 3 : c.severity === 2 ? 5 : 8
+  const urgency = Math.round(Math.max(0, Math.min(30, (1 - remain / (sla + 1)) * 30)))
+  const member = c.member_id ? 3 : 0
+  const score = sevBase + escal + urgency + member
+  return { score, urgency_level: score >= 70 ? 'urgent' : score >= 40 ? 'high' : 'normal' }
 }
-
-// 某日每营业小时的预约客流预测（入园预约 + 热门设施预约折算 + 未来日散客外推）
-function hourlyFlow(day, walkMap) {
-  const out = []
-  for (let hour = OPEN_HOUR; hour <= CLOSE_HOUR; hour++) {
-    const entry = db.prepare("SELECT COALESCE(SUM(booked_count),0) n FROM reservation_slots WHERE scope='entry' AND day=? AND hour=?")
-      .get(day, hour).n
-    const ride = db.prepare("SELECT COALESCE(SUM(booked_count),0) n FROM reservation_slots WHERE scope='ride' AND day=? AND hour=?")
-      .get(day, hour).n
-    let flow = entry + Math.round(ride * 0.35)   // 设施排队同样产生秩序/保洁压力
-    if (day > ctx.day()) {
-      // 未来日：按近 3 天散客均值外推（新园无历史时，用基准客流的时段系数兜底）
-      const hist = walkMap.get(hour)
-      flow += hist ? Math.round(hist * 0.6) : Math.round(num(getSetting('guestBase'), 600) * (hour <= 10 ? 0.5 : hour >= 16 ? 0.6 : 1) * 0.6)
-    }
-    out.push({ hour, entry, ride: Math.round(ride * 0.35), flow })
-  }
-  return out
+function orderPriority(o) {
+  const base = o.status === 'processing' ? 55 : 40
+  const near = Math.round(Math.max(0, Math.min(20, num(o.progress) / 5)))
+  const score = base + near
+  return { score, urgency_level: score >= 65 ? 'urgent' : score >= 45 ? 'high' : 'normal' }
 }
 
 // 某日需求画像：班段 × 岗位（保安/保洁/维修）需求人数与依据
 export function demandForDay(day) {
   day = Math.round(num(day))
-  const walkMap = avgWalkinByHour()
-  const hours = hourlyFlow(day, walkMap)
   const openZones = db.prepare('SELECT id,name FROM zones WHERE open=1 AND unlocked=1 ORDER BY id').all()
   const zoneN = openZones.length
   const guardFlowPer = Math.max(100, num(getSetting('dispatchGuardFlow'), 500))
   const cleanFlowPer = Math.max(100, num(getSetting('dispatchCleanFlow'), 700))
 
+  // 统一客流预测：班段 peak（峰值，秩序岗）/ flow（总量，卫生岗）+ 来源拆解（散客/散约/会员/团单）
+  const fc = forecastForDay(day)
+  const hourMap = new Map(fc.hours.map(h => [h.hour, h]))
+  const hours = fc.hours.map(h => ({ hour: h.hour, entry: h.reserved, ride: h.ride_pressure, flow: h.flow,
+    walkin: h.walkin, guest: h.guest_reserved, member: h.member_reserved, group: h.group_reserved }))
+
   const bands = BANDS.map(b => {
     const hs = hours.filter(h => b.hours.includes(h.hour))
     const flow = hs.reduce((s, h) => s + h.flow, 0)
     const peak = hs.reduce((m, h) => Math.max(m, h.flow), 0)
+    // 峰值出现的小时集合（用于跨日夜班次日 9:00 交接覆盖判定）
+    const peakHours = hs.filter(h => h.flow === peak).map(h => h.hour)
     return {
       key: b.key, label: b.label, shift_code: b.shift_code, hours: b.hours,
-      flow, peak,
+      flow, peak, peakHours,
+      reserved: hs.reduce((s, h) => s + (h.guest + h.member + h.group), 0),
+      walkin: hs.reduce((s, h) => s + h.walkin, 0),
+      guest_reserved: hs.reduce((s, h) => s + h.guest, 0),
+      member_reserved: hs.reduce((s, h) => s + h.member, 0),
+      group_reserved: hs.reduce((s, h) => s + h.group, 0),
       // 客流驱动：每满一个承载阈值增配 1 人；至少保障每个班段有人（区域基线另行全日校验）
       need_guard: Math.max(zoneN ? 1 : 0, Math.ceil(peak / guardFlowPer)),
       need_clean: Math.max(zoneN ? 1 : 0, Math.ceil(flow / cleanFlowPer)),
@@ -594,22 +594,29 @@ export function demandForDay(day) {
   })
   const bandOf = k => bands.find(x => x.key === k)
 
-  // 检修工单需求：每个在途工单需 1 名维修工；检修中优先排到早/中班推进，排队工单排早班接单
-  const orders = db.prepare(`SELECT mo.id, mo.code, mo.status, mo.progress, r.name ride_name, r.zone_id
+  // 检修工单需求：每个在途工单需 1 名维修工；按优先级（检修中/接近完工优先）分到早/中班，
+  // 排队工单优先早班接单；同时携带优先级分值供动态补位排序
+  const orders = db.prepare(`SELECT mo.id, mo.code, mo.status, mo.progress, mo.assignee_id, r.name ride_name, r.zone_id
                              FROM maintenance_orders mo JOIN rides r ON r.id=mo.ride_id
                              WHERE mo.status IN ('queued','processing') ORDER BY mo.status, mo.id`).all()
-  for (const o of orders) {
-    const target = o.status === 'processing' ? (bandOf('mid').need_repair <= bandOf('morning').need_repair ? 'mid' : 'morning') : 'morning'
+  const ordersRich = orders.map(o => ({ ...o, ...orderPriority(o) }))
+    .sort((a, b) => b.score - a.score)
+  for (const o of ordersRich) {
+    const target = o.status === 'processing'
+      ? (bandOf('mid').need_repair <= bandOf('morning').need_repair ? 'mid' : 'morning')
+      : 'morning'
     bandOf(target).need_repair += 1
-    const b = bandOf(target)
-    ;(b.orders ||= []).push({ id: o.id, code: o.code, status: o.status, ride_name: o.ride_name, progress: o.progress, zone_id: o.zone_id })
+    ;(bandOf(target).orders ||= []).push(o)
   }
 
-  // 投诉岗位需求：按岗位分组（保安类/保洁/维修）；紧急投诉优先早班，其余按严重度摊到早/中/晚
+  // 投诉岗位需求：按岗位分组（保安类/保洁/维修）；紧急投诉强制早班，其余按严重度摊到早/中/晚；
+  // 每条携带优先级分值（SLA/升级/会员加权），动态补位按分值先补最急投诉
   const compBands = ['morning', 'mid', 'evening']
-  const complaints = db.prepare("SELECT id,code,category,severity,status FROM complaints WHERE status IN ('open','processing','ready') ORDER BY severity DESC,id LIMIT 40").all()
+  const complaints = db.prepare("SELECT id,code,category,severity,status,escalations,deadline_tick,member_id FROM complaints WHERE status IN ('open','processing','ready') ORDER BY severity DESC,id LIMIT 40").all()
+  const complaintsRich = complaints.map(c => ({ ...c, ...complaintPriority(c) }))
+    .sort((a, b) => b.score - a.score)
   let compCursor = 0
-  for (const c of complaints) {
+  for (const c of complaintsRich) {
     const roles = (ctx.complaintRoles?.[c.category] || []).filter(Boolean)
     if (!roles.length) continue   // 服务态度/价格争议无专属岗位，不进入排班需求
     let group = roles.some(r => GUARD_ROLE_SET.includes(r)) ? 'guard'
@@ -618,7 +625,8 @@ export function demandForDay(day) {
     if (!group) continue
     const key = c.severity === 3 ? 'morning' : compBands[compCursor++ % compBands.length]
     const b = bandOf(key)
-    b.complaints.push({ id: c.id, code: c.code, category: c.category, severity: c.severity, roles })
+    b.complaints.push({ id: c.id, code: c.code, category: c.category, severity: c.severity, roles,
+      priority: c.score, urgency: c.urgency_level, escalated: num(c.escalations, 0), member: c.member_id ? 1 : 0 })
   }
   for (const b of bands) {
     const byRole = { guard: 0, clean: 0, repair: 0 }
@@ -629,6 +637,10 @@ export function demandForDay(day) {
     b.need_guard = Math.max(b.need_guard, byRole.guard > 0 ? 1 : 0)
     b.need_clean = Math.max(b.need_clean, byRole.clean > 0 ? 1 : 0)
     b.need_repair = b.need_repair + (byRole.repair > 0 ? 1 : 0)
+    // 班段综合优先级（用于缺口排序）：取本班最急工单/投诉的最大分值
+    const orderScore = Math.max(0, ...(b.orders || []).map(o => o.score))
+    const compScore = Math.max(0, ...b.complaints.map(c => c.priority))
+    b.priority = Math.max(orderScore, compScore)
   }
 
   // 跨日夜班需求：每 N 个开放区域至少 1 名夜勤保安（默认 N=0 不强制，运营可调）
@@ -643,7 +655,9 @@ export function demandForDay(day) {
     zones: openZones,
     hours,
     bands,
-    flowTotal: hours.reduce((s, h) => s + h.flow, 0),
+    flowTotal: fc.totals.flow,
+    forecast: fc.totals,
+    confidence: fc.confidence,
     openOrders: orders.length,
     openComplaints: complaints.length
   }
@@ -694,6 +708,55 @@ function countByBand(list, day, bandKey, roleCheck) {
   }).length
 }
 
+// 跨日夜班次日交接：前一日 17:00 上班的夜班保安在当日 9:00 才下班，
+// 当日早班开班小时（9:00）由夜班值守人员实际承担秩序岗——计入早班保安「交接覆盖」。
+// 仅认可 9:00 交接那一刻：非 9 点时段夜班已下班，不顶替早班峰值需求（避免低估高峰缺口）。
+// 未来日：前一日有效夜班排班即视为可交接；
+// 当日：仅在 9:00 这个 tick 认可（夜班此刻在岗或在本 tick 下班结算），9 点过后交接即结束。
+function countNightHandoverGuards(list, day) {
+  const t = ctx.tick()
+  const handoverTick = linear(day, OPEN_HOUR)
+  return list.filter(s => {
+    if (!s.cross_day || !GUARD_ROLES.includes(s.role)) return false
+    if (s.sched_day !== day - 1) return false
+    if (day !== ctx.day()) return true                    // 未来日：按排班计划认可交接
+    // 当日：交接只在开班 9:00 这个 tick 有效（t>9:00 夜班必已结算离岗，不再顶替早班）。
+    if (t !== handoverTick) return false
+    // 9:00 tick 两种形态都算完成交接：引擎结算前仍在岗（班次区间恰至 9:00）；或已在本 tick 下班结算。
+    if (s.att_status === 'checked_in') return s.end_linear >= handoverTick && s.begin_linear <= handoverTick
+    if (['checked_out', 'leave'].includes(s.att_status)) return (s.att_id ? atCheckout(s.att_id) : 0) >= handoverTick
+    return false
+  }).length
+}
+function atCheckout(attId) {
+  return num(db.prepare('SELECT checkout_tick FROM staff_attendance WHERE id=?').get(attId)?.checkout_tick)
+}
+
+// 早班保安小时级缺口（跨日夜班交接仅覆盖开班 9:00，不顶替 10/11 点峰值）
+// 返回 { need, have, handover, peakHour, gap }：have 为早班本身在岗，handover 为夜班交接人数
+function morningGuardCoverage(demand, list, day, { forDispatch = true } = {}) {
+  const b = demand.bands.find(x => x.key === 'morning')
+  const need = b.need_guard
+  const own = countByBand(list, day, 'morning', r => GUARD_ROLES.includes(r))
+  const handover = countNightHandoverGuards(list, day)
+  const guardFlowPer = Math.max(100, num(getSetting('dispatchGuardFlow'), 500))
+  // 峰值小时：班段内综合客流压力最大的小时（可多个并列；峰值为 0 即仅区域基线 1 人）
+  const peak = Math.max(0, ...b.hours.map(h => (demand.hours.find(x => x.hour === h)?.flow) || 0))
+  const peakHours = b.hours.filter(h => (demand.hours.find(x => x.hour === h)?.flow || 0) === peak)
+  // 逐小时需求：ceil(hourFlow / per)，与班段峰值口径自洽（max=need）
+  const hourlyNeed = h => Math.max(demand.zones.length ? 1 : 0,
+    Math.ceil((demand.hours.find(x => x.hour === h)?.flow || 0) / guardFlowPer))
+  // 交接只在 9:00 有效：当 9 点为峰值小时（含峰值为 0、仅需区域基线 1 人的情况），
+  // 夜班交接人员可以完整覆盖开班小时，抵减早班保安缺口；否则峰值在 10/11 点，交接下班即缺岗，不抵峰值。
+  const handoverUseful = peak === 0 || peakHours.includes(OPEN_HOUR)
+  const effHandover = handoverUseful ? Math.min(handover, Math.max(0, need - own)) : 0
+  const have = own + effHandover
+  return {
+    need, have, gap: Math.max(0, need - have), own, handover: effHandover, handoverTotal: handover,
+    handoverUseful, peakHours, hourlyNeed
+  }
+}
+
 // 排班/调班后校验当日岗位覆盖：客流/检修/投诉需求与班段在岗对比，给出量化缺口预警
 // - warn：未来班段/未来日缺口，可由动态调度自动补位或主管调班补齐；
 // - block：当天班段已经开始且在岗不足（检修中工单/紧急投诉无匹配岗位时升级为 block）
@@ -706,7 +769,7 @@ export function coverageForDay(day) {
   const t = ctx.tick()
   const bandStarted = b => isToday && b.hours.some(h => linear(day, h) <= t)
 
-  // 1) 区域全日基线：每个开放区域需有保安/安保与保洁（按员工归属区域）
+  // 1) 区域全日基线：每个开放区域需有保安/安保与保洁（按员工归属区域；夜班交接不替代全日归属）
   const zones = db.prepare('SELECT * FROM zones WHERE open=1 AND unlocked=1 ORDER BY id').all()
   for (const z of zones) {
     const here = list.filter(s => s.zone_id === z.id && !s.cross_day && s.sched_day === day)
@@ -725,35 +788,51 @@ export function coverageForDay(day) {
     for (const c of checks) {
       const need = b[c.key]
       if (!need) continue
-      const have = countByBand(list, day, b.key, r => c.roles.includes(r))
+      // 早班保安：小时级核算，计入跨日夜班次日 9:00 交接覆盖
+      let have, gap, handoverInfo = null
+      if (c.key === 'need_guard' && b.key === 'morning') {
+        const mc = morningGuardCoverage(demand, list, day)
+        have = mc.have; gap = mc.gap
+        handoverInfo = mc.handover > 0 ? `（含前日夜班交接 ${mc.handover} 人至 9:00）` : ''
+      } else {
+        have = countByBand(list, day, b.key, r => c.roles.includes(r))
+        gap = need - have
+      }
       if (have >= need) continue
       const started = bandStarted(b)
-      let level = started ? 'warn' : 'warn'
+      let level = 'warn'
       let reason = ''
       if (c.key === 'need_repair') {
         const proc = (b.orders || []).some(o => o.status === 'processing')
+        // 检修优先级：检修中且班段已开始为红色硬缺岗；接近完工（priority≥65）同样提级
         level = started && proc ? 'block' : 'warn'
-        reason = `检修工单 ${(b.orders || []).map(o => o.code).join('、')} 需要 ${c.roleName}`
+        reason = `检修工单 ${(b.orders || []).map(o => `${o.code}〔优先级 ${o.score}〕`).join('、')} 需要 ${c.roleName}`
       } else {
         reason = `${b.label}预测客流峰值 ${b.peak} 人`
       }
-      push(c.type, level, `${b.label}（${b.hours[0]}:00~${b.key === 'evening' ? 18 : b.hours[b.hours.length - 1] + 1}:00）${c.roleName}需求 ${need} 人、在岗 ${have} 人，缺口 ${need - have} 人：${reason}`,
-        { band: b.key, role: c.roleName, need, have, gap: need - have })
+      push(c.type, level, `${b.label}（${b.hours[0]}:00~${b.key === 'evening' ? 18 : b.hours[b.hours.length - 1] + 1}:00）${c.roleName}需求 ${need} 人、在岗 ${have} 人，缺口 ${gap} 人：${reason}${handoverInfo || ''}`,
+        { band: b.key, role: c.roleName, need, have, gap })
     }
-    // 投诉岗位缺口（按班段挂载的投诉逐条提示，紧急投诉且班段已开始 → block）
+    // 投诉岗位缺口（按班段挂载的投诉逐条提示，按优先级判定：紧急/高优且班段已开始 → block）
     for (const c of b.complaints) {
       const roles = c.roles
       const roleCheck = r => roles.some(x => GUARD_ROLES.includes(x) ? GUARD_ROLES.includes(r) : r === x)
-      const have = countByBand(list, day, b.key, roleCheck)
+      let have = countByBand(list, day, b.key, roleCheck)
+      // 早班保安类投诉：夜班交接人员 9:00 也可接手
+      if (b.key === 'morning' && roles.some(r => GUARD_ROLES.includes(r))) {
+        have += countNightHandoverGuards(list, day)
+      }
       if (have > 0) continue
-      const level = bandStarted(b) && c.severity === 3 ? 'block' : 'warn'
+      const hard = c.severity === 3 || c.urgency === 'urgent'
+      const level = bandStarted(b) && hard ? 'block' : 'warn'
+      const tag = c.urgency === 'urgent' ? '紧急' : c.urgency === 'high' ? '高优' : ''
       push('complaint', level,
-        `${b.label}投诉 ${c.code}（${c.severity === 3 ? '紧急' : c.severity === 2 ? '严重' : '一般'}）需「${roles.join('/')}」岗位，当前缺口 1 人`,
-        { band: b.key, complaint_id: c.id, complaint_code: c.code, severity: c.severity, need: 1, have: 0, gap: 1 })
+        `${b.label}投诉 ${c.code}（${c.severity === 3 ? '紧急' : c.severity === 2 ? '严重' : '一般'}${tag ? `·${tag}` : ''}·优先级 ${c.priority}）需「${roles.join('/')}」岗位，当前缺口 1 人`,
+        { band: b.key, complaint_id: c.id, complaint_code: c.code, severity: c.severity, priority: c.priority, urgency: c.urgency, need: 1, have: 0, gap: 1 })
     }
   }
 
-  // 3) 在途检修工单兜底（无任何维修工排班 → 沿用旧版强提示）
+  // 3) 在途检修工单兜底（无任何维修工排班 → 沿用旧版强提示；优先级随工单）
   const allOrders = db.prepare("SELECT mo.*, r.name ride_name FROM maintenance_orders mo JOIN rides r ON r.id=mo.ride_id WHERE mo.status IN ('queued','processing')").all()
   for (const o of allOrders) {
     const covered = list.some(s => s.role === '维修' && !s.cross_day && s.sched_day === day)
@@ -826,13 +905,26 @@ export function gapsForDay(day, { forDispatch = true } = {}) {
       // 维修工需求含投诉驱动（need_repair 已合并检修工单 + 设施类投诉）；保安/保洁需求已含投诉兜底
       const need = b[c.needKey]
       if (!need) continue
-      const have = forDispatch ? countRole(b.key, rolesArr) : countByBand(list, day, b.key, r => rolesArr.includes(r))
+      let have, handover = 0
+      if (c.needKey === 'need_guard' && b.key === 'morning') {
+        // 早班保安：计入前一日跨日夜班次日 9:00 交接覆盖
+        const mc = morningGuardCoverage(demand, list, day, { forDispatch })
+        have = mc.have; handover = mc.handover
+      } else {
+        have = forDispatch ? countRole(b.key, rolesArr) : countByBand(list, day, b.key, r => rolesArr.includes(r))
+      }
       if (have >= need) continue
       // 硬需求只认本岗位相关的工单/投诉（维修缺口挂维修工单，保安/保洁缺口不会因为有检修单就变硬）
       const relatedComplaints = b.complaints.filter(x => rolesArr.some(r => (x.roles || []).includes(r)))
       const relatedOrders = c.role === '维修工' ? (b.orders || []) : []
       const hard = relatedOrders.length > 0 || relatedComplaints.length > 0
-      gaps.push({ band: b.key, role: c.role, roles: rolesArr, need, have, gap: need - have, hard,
+      // 缺口优先级：取本班最急工单/投诉分值（纯客流缺口为 0）；跨日/当天已开始的硬缺口再加权，先补最急
+      const orderScore = Math.max(0, ...relatedOrders.map(o => o.score || 0))
+      const compScore = Math.max(0, ...relatedComplaints.map(x => x.priority || 0))
+      const liveWeight = day === ctx.day() ? 10 : 0
+      const priority = Math.max(orderScore, compScore) + (hard ? liveWeight : 0)
+      gaps.push({ band: b.key, role: c.role, roles: rolesArr, need, have, gap: need - have, hard, handover,
+        priority, orderPriority: orderScore, complaintPriority: compScore,
         orders: relatedOrders, complaints: relatedComplaints })
     }
   }
@@ -853,10 +945,10 @@ export function runDynamicDispatch({ horizon = 3, reason = '', urgentOvertime = 
     // 逐班段 × 岗位缺口补位；每补一个人都会影响候选池与缺口数，故每轮实时重算
     for (const band of BANDS) {
       for (let pass = 0; pass < 24; pass++) {
-        // 该班段仍未消解的全部岗位缺口，按硬需求（检修/投诉）优先补
+        // 该班段仍未消解的全部岗位缺口，按优先级（检修/投诉 SLA 紧迫度）→ 硬需求 → 缺口人数排序
         const gapsNow = gapsForDay(d).gaps
           .filter(x => x.band === band.key && x.gap > 0)
-          .sort((a, b2) => Number(b2.hard) - Number(a.hard) || b2.gap - a.gap)
+          .sort((a, b2) => b2.priority - a.priority || Number(b2.hard) - Number(a.hard) || b2.gap - a.gap)
         if (!gapsNow.length) break
         const g = gapsNow[0]
         const sh = shifts.find(x => x.code === band.shift_code)
@@ -954,6 +1046,24 @@ export function maybeDispatchAfter(reason = '岗位需求变化') {
     return runDynamicDispatch({ reason })
   } catch (e) {
     console.error('[scheduling] 联动动态调度失败（不影响主操作）:', e)
+    return { ok: false, msg: '动态调度失败' }
+  }
+}
+
+// 预约/团单库存变化（下单/改签/退款/核销/锁名额/退团/停运重排）后触发的调度重评估。
+// 与 maybeDispatchAfter 的区别：同一游戏 tick 内只跑一次（一次引擎/一批操作可能改几十个时段，
+// 逐操作跑动态调度代价高且结果相同），在调用方事务提交后调用（补位失败不回滚主操作）。
+let _inventoryDispatchTick = -1
+export function scheduleDispatchOnInventoryChange(reason = '预约库存变化驱动排班重评估') {
+  if (!num(getSetting('scheduleAutoFill'), 1)) return { ok: true, skipped: true }
+  if (getSetting('scheduleMode', 'dynamic') !== 'dynamic') return { ok: true, skipped: true }
+  const tk = ctx.tick()
+  if (tk === _inventoryDispatchTick) return { ok: true, skipped: true, throttled: true }
+  _inventoryDispatchTick = tk
+  try {
+    return runDynamicDispatch({ horizon: 3, urgentOvertime: true, reason })
+  } catch (e) {
+    console.error('[scheduling] 库存联动动态调度失败（不影响主操作）:', e)
     return { ok: false, msg: '动态调度失败' }
   }
 }
