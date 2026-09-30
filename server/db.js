@@ -588,6 +588,52 @@ CREATE TABLE IF NOT EXISTS group_logs (
   staff_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_glog_group ON group_logs(group_id);
+
+-- ---------------- 统一客流预测与资源调度闭环 ----------------
+-- 客流预测日快照：引擎每小时把「预约库存（散客/团队/会员）+ 散客外推 + 自适应修正」的统一预测落库，
+-- 是动态排班需求画像、跨日夜班衔接与前端闭环看板共同的事实源；日结时回填实际客流做精度学习。
+CREATE TABLE IF NOT EXISTS flow_forecast_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  day INTEGER NOT NULL,                  -- 预测的目标游戏日
+  hour INTEGER NOT NULL DEFAULT 0,       -- 0=全日汇总；否则为该营业小时的预测
+  predicted_flow INTEGER NOT NULL DEFAULT 0,  -- 统一预测客流（入园预约 + 团队 + 设施折算 + 散客外推，已乘自适应系数）
+  reserve_entry INTEGER NOT NULL DEFAULT 0,   -- 散客/会员入园预约在途人数
+  group_entry INTEGER NOT NULL DEFAULT 0,     -- 团队入园名额（已确认 + 待确认按置信折算）
+  reserve_ride INTEGER NOT NULL DEFAULT 0,    -- 设施预约折算客流（含团队行程）
+  walkin_forecast INTEGER NOT NULL DEFAULT 0, -- 散客（非预约）外推预测
+  member_share REAL NOT NULL DEFAULT 0,       -- 预约中会员占比（0~1）
+  actual_flow INTEGER NOT NULL DEFAULT 0,    -- 日结回填：当日实际入园/折算客流
+  accuracy REAL NOT NULL DEFAULT 0,           -- 日结回填：预测命中率（0~1）
+  adjust_factor REAL NOT NULL DEFAULT 1,      -- 本快照采用的散客外推自适应系数
+  settled INTEGER NOT NULL DEFAULT 0,         -- 0 进行中 / 1 日结已回填学习
+  update_tick INTEGER NOT NULL DEFAULT 0,
+  update_day INTEGER NOT NULL DEFAULT 0,
+  settle_tick INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_flow_snap_day_hour ON flow_forecast_snapshots(day,hour);
+CREATE INDEX IF NOT EXISTS idx_flow_snap_settled ON flow_forecast_snapshots(settled,day);
+
+-- 闭环一致性巡检结果（每小时引擎巡检 + 手动触发）：排班/预约/库存/团账/财务口径不一致时落库告警
+-- auto_heal=1 的项（如时段计数器漂移）会被安全自愈；资金/团账类只告警不自动改写，等待人工核对。
+CREATE TABLE IF NOT EXISTS reconcile_findings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',          -- RC0001
+  kind TEXT NOT NULL,                     -- slot_counter/finance_refund/finance_wage/group_ledger/attendance/schedule_conflict
+  level TEXT NOT NULL DEFAULT 'warn',     -- warn 预警 / block 严重不一致
+  ref_type TEXT NOT NULL DEFAULT '',      -- slot/reservation/group/attendance/schedule
+  ref_id INTEGER,
+  day INTEGER NOT NULL DEFAULT 0,
+  title TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT '',
+  expected TEXT NOT NULL DEFAULT '',      -- 期望值快照（JSON）
+  actual TEXT NOT NULL DEFAULT '',        -- 实际值快照（JSON）
+  status TEXT NOT NULL DEFAULT 'open',    -- open 未处理 / healed 已自愈 / ignored 已忽略
+  tick INTEGER NOT NULL,
+  created_day INTEGER NOT NULL,
+  heal_tick INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_reconcile_status ON reconcile_findings(status,kind);
+CREATE INDEX IF NOT EXISTS idx_reconcile_ref ON reconcile_findings(ref_type,ref_id)
 `)
 
 // ---------- 轻量列迁移（兼容老库） ----------
@@ -613,16 +659,33 @@ ensureColumn('reservations', 'group_item_id', "group_item_id INTEGER")
 // 多步写入（库存/订单/现金/流水/日志）必须原子提交：任一步失败整体回滚，不留半完成状态。
 // 嵌套调用并入外层事务（node:sqlite 单连接同步执行，靠深度计数避免嵌套 BEGIN 报错）。
 let txDepth = 0
+// 事务后回调队列：仅在事务成功 COMMIT 后执行（回滚一律丢弃）。
+// 用于「库存/团单变化 → 客流预测快照与动态调度重算」这类闭环联动：
+// 联动在提交后触发，保证读到的是已落库的一致状态，且联动异常不会污染/回滚主业务事务。
+let afterCommitQueue = []
+function afterCommit(fn) {
+  if (typeof fn !== 'function') return
+  if (txDepth > 0) afterCommitQueue.push(fn)
+  else { try { fn() } catch (e) { console.error('[db] afterCommit 回调执行失败（不影响主事务）:', e) } }
+}
 function tx(fn) {
   if (txDepth > 0) return fn()
   db.exec('BEGIN IMMEDIATE')
   txDepth++
+  const pending = afterCommitQueue
+  afterCommitQueue = []
   try {
     const r = fn()
     db.exec('COMMIT')
+    const cbs = afterCommitQueue
+    afterCommitQueue = pending
+    // 提交成功后才触发联动；回调自身异常不影响已提交的业务结果
+    for (const cb of cbs) { try { cb() } catch (e) { console.error('[db] afterCommit 联动失败（事务已提交，不影响业务结果）:', e) } }
     return r
   } catch (e) {
     try { db.exec('ROLLBACK') } catch { /* 连接已回滚时忽略 */ }
+    // 回滚：丢弃本事务登记的全部联动，绝不让未生效的库存/订单变化触发重排
+    afterCommitQueue = pending
     throw e
   } finally {
     txDepth--
@@ -840,4 +903,4 @@ function ensureScheduleBaseData() {
 ensureScheduleBaseData()
 
 export default db
-export { now, getSetting, setSetting, tx }
+export { now, getSetting, setSetting, tx, afterCommit }

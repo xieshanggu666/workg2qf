@@ -103,7 +103,10 @@ export const useParkStore = defineStore('park', {
     // 领队组团
     groups: s => s.data?.groups || [],
     groupStats: s => s.data?.groupStats || emptyGroupStats(),
-    groupConfig: s => s.data?.groupConfig || { enabled: 1, depositRate: 0.3, minQty: 5, maxQty: 120, days: 3, entryHours: [9, 10, 11, 12, 13, 14, 15, 16, 17, 18], rideHours: [9, 10, 11, 12, 13, 14, 15, 16, 17] }
+    groupConfig: s => s.data?.groupConfig || { enabled: 1, depositRate: 0.3, minQty: 5, maxQty: 120, days: 3, entryHours: [9, 10, 11, 12, 13, 14, 15, 16, 17, 18], rideHours: [9, 10, 11, 12, 13, 14, 15, 16, 17] },
+    // 统一客流预测与资源调度闭环
+    closedLoop: s => s.data?.closedLoop || { days: [], forecast: { factor: 1, days: [] }, reconcile: { open: 0, blocks: 0 } },
+    reconcileList: s => s.data?.reconcileList || []
   },
   actions: {
     async refresh() {
@@ -192,6 +195,10 @@ export const useParkStore = defineStore('park', {
     rerouteGroupItem(id, slot_id, request_id) { return this.api('POST', `/group-items/${id}/reroute`, { slot_id, request_id }) },
     refundOutageItem(id, request_id) { return this.api('POST', `/group-items/${id}/refund-outage`, { request_id }) },
     saveGroupConfig(payload) { return this.api('POST', '/group-config', payload) },
-    async groupDetail(id) { return j('GET', `/groups/${id}`) }
+    async groupDetail(id) { return j('GET', `/groups/${id}`) },
+    // 统一客流预测与资源调度闭环
+    async closedLoop(horizon = 3) { return j('GET', `/closed-loop?horizon=${horizon}`) },
+    runReconcile(autoHeal = true) { return this.api('POST', '/reconcile/run', { auto_heal: autoHeal }) },
+    ignoreReconcile(id) { return this.api('POST', `/reconcile/${id}/ignore`, {}) }
   }
 })

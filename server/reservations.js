@@ -1,4 +1,5 @@
 import db, { getSetting, setSetting, tx } from './db.js'
+import { markFlowDirty } from './flow.js'
 
 // 分时预约模块：入园时段 9:00~18:00；设施时段 9:00~17:00（末班需留出运行时间）
 const OPEN_HOUR = 9
@@ -235,6 +236,8 @@ function bookSlot(slot, { guest_name, guest_phone, qty, amount, scope, rideId, s
     }
     logReservation(id, source === 'auto' ? 'auto_book' : 'create',
       `${scope === 'entry' ? '入园' : '设施'}预约 ${slot.day}日 ${slot.hour}:00 · ${qty} 人 · 预收 ¥${amount}${fastpass ? ' · 快速通行券' : ''}`)
+    // 闭环：库存变化在事务提交后刷新统一客流预测并触发动态调度（回滚则不触发）
+    markFlowDirty('预约下单库存')
     return { ok: true, id, code }
   })
 }
@@ -286,6 +289,8 @@ function refundOne(rsv, reason, note, opts = {}) {
   }
   logReservation(rsv.id, half ? 'cancel' : 'refund',
     `${note || '退款'}：退回 ¥${back}${fee ? `，手续费 ¥${fee}` : ''}${rsv.benefit_id && !half ? '；会员权益已返还' : ''}`)
+  // 闭环：退款释放名额后刷新预测并重排（退款回滚则不触发，避免排班跟着未生效的退款走）
+  markFlowDirty('预约退款库存')
 
   if (!opts.skipComplaint && reason === 'overbook' && ctx.createComplaint) {
     const ride = rsv.ride_id ? db.prepare('SELECT * FROM rides WHERE id=?').get(rsv.ride_id) : null
@@ -367,6 +372,7 @@ export function rescheduleReservation(id, targetSlotId, requestId = '') {
       // 3) 原时段释放（走到这里前两步已成功；任一步抛错整体回滚，库存不会凭空蒸发或重复占用）
       db.prepare('UPDATE reservation_slots SET booked_count=MAX(0,booked_count-?) WHERE id=?').run(rsv.qty, rsv.slot_id)
       logReservation(id, 'reschedule', `改签为 ${target.day}日 ${target.hour}:00（第 ${rsv.reschedules + 1} 次改签）`)
+      markFlowDirty('预约改签库存')
       return { ok: true, reschedules: rsv.reschedules + 1 }
     })
   })

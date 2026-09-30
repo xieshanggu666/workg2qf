@@ -7,6 +7,7 @@ import RidesView from '@/components/RidesView.vue'
 import VendorsView from '@/components/VendorsView.vue'
 import StaffView from '@/components/StaffView.vue'
 import SchedulingView from '@/components/SchedulingView.vue'
+import ClosedLoopView from '@/components/ClosedLoopView.vue'
 import TicketView from '@/components/TicketView.vue'
 import MembersView from '@/components/MembersView.vue'
 import ReservationsView from '@/components/ReservationsView.vue'
@@ -25,6 +26,7 @@ const navs = [
   { k: 'vendors', icon: '🏪', label: '商铺' },
   { k: 'staff', icon: '👷', label: '员工管理' },
   { k: 'scheduling', icon: '🗓️', label: '排班工时' },
+  { k: 'closedloop', icon: '🔄', label: '客流调度闭环' },
   { k: 'ticket', icon: '🎫', label: '票务定价' },
   { k: 'members', icon: '💎', label: '会员权益' },
   { k: 'reservations', icon: '📅', label: '预约调度' },
@@ -70,6 +72,7 @@ onMounted(store.refresh)
           <span class="halo" v-if="store.schedulingStats.pendingRequests">🗓️ {{ store.schedulingStats.pendingRequests }} 个调班/加班待审批</span>
           <span class="halo red" v-if="store.schedulingStats.absentToday">❌ {{ store.schedulingStats.absentToday }} 人今日旷工</span>
           <span class="halo" v-if="store.schedulingStats.coverageBlocks">⛔ {{ store.schedulingStats.coverageBlocks }} 项关键岗位缺岗</span>
+          <span class="halo red" v-if="store.closedLoop?.reconcile?.blocks">🔍 {{ store.closedLoop.reconcile.blocks }} 项闭环账实不符待核对</span>
           <span class="halo" v-if="store.reservationStats.oversoldPending">⚠️ {{ store.reservationStats.oversoldPending }} 个超售时段待消化</span>
           <span class="halo" v-if="store.groupStats.pending">🧑‍✈️ {{ store.groupStats.pending }} 个团队待确认</span>
           <span class="halo red" v-if="store.groupStats.interrupted">🚧 {{ store.groupStats.interrupted }} 段团队行程停运待处置</span>
@@ -90,6 +93,7 @@ onMounted(store.refresh)
         <VendorsView v-else-if="view === 'vendors'" />
         <StaffView v-else-if="view === 'staff'" />
         <SchedulingView v-else-if="view === 'scheduling'" />
+        <ClosedLoopView v-else-if="view === 'closedloop'" />
         <TicketView v-else-if="view === 'ticket'" />
         <MembersView v-else-if="view === 'members'" />
         <ReservationsView v-else-if="view === 'reservations'" />

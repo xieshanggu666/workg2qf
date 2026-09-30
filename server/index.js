@@ -36,6 +36,10 @@ import {
   refundInterruptedItem, handleParkOutageGroupRows, refundGroupsByRide,
   autoSimulateGroup, autoGroupTick, listGroups, groupDetail, groupStats, GROUP_CONST
 } from './groups.js'
+import {
+  initFlowContext, refreshForecastSnapshots, settleForecastLearning,
+  runReconcile, listFindings, ignoreFinding, closedLoopOverview, reconcileStats
+} from './flow.js'
 
 const app = express()
 app.use(express.json())
@@ -126,6 +130,13 @@ initGroupContext({
 initReservationContext({
   handleParkOutageGroup: (rows, info) => handleParkOutageGroupRows(rows, info)
 })
+
+// 统一客流预测与资源调度闭环：库存/团单在事务提交后刷新统一预测快照，并按动态模式触发调度重排
+initFlowContext({
+  dispatchAfter: (reason) => maybeDispatchAfter(reason)
+})
+// 启动即生成首版未来三天统一预测快照（闭环看板/排班需求画像的事实源）
+try { refreshForecastSnapshots() } catch (e) { console.error('[flow] 初始预测快照失败:', e) }
 
 // ---------------- 分期贷款 ----------------
 const activeLoans = () => db.prepare("SELECT * FROM loans WHERE status='active' ORDER BY id").all()
@@ -580,6 +591,9 @@ function tick() {
     }
     day += 1
     setSetting('day', day)
+    // 统一客流闭环：新一天首个 tick 对「刚结束的一天」回填实际客流、计算预测命中率并学习散客外推系数。
+    // 此时昨日全部营业小时已结束、visitors 完整；幂等（快照已 settled 自动跳过）。
+    try { settleForecastLearning(day - 1) } catch (e) { console.error('[flow] 预测学习失败:', e) }
   }
   setSetting('hour', hour)
 
@@ -758,6 +772,23 @@ function tick() {
   maybeSpawnEvent(day)
 
   checkBrokenDown(day)
+
+  // 统一客流预测与资源调度闭环：每小时刷新未来三天预测快照（库存/团单变化后统一口径）
+  try { refreshForecastSnapshots() } catch (e) { console.error('[flow] 预测快照刷新失败:', e) }
+  // 闭环一致性巡检：库存计数器漂移自动自愈；资金/团账/跨日排班冲突只告警不擅改
+  // 整点巡检落事件（与上次结果去重，避免刷屏）
+  try {
+    const rc = runReconcile({ autoHeal: true })
+    if (rc.found > 0 && rc.blocks > 0) {
+      const lastEvt = db.prepare("SELECT id FROM events WHERE type='reconcile' AND day=? ORDER BY id DESC LIMIT 1").get(day)
+      if (!lastEvt) {
+        db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+          .run(tickCount, day, 'reconcile', '闭环巡检发现排班/预约/财务口径异常',
+            `本轮巡检发现 ${rc.found} 项偏差（严重 ${rc.blocks} 项，已自愈 ${rc.healed} 项）。计数器漂移已自动校正；资金/团账/跨日排班冲突需人工在「客流调度闭环」页核对处理。`,
+            -1, 'active')
+      }
+    }
+  } catch (e) { console.error('[flow] 闭环一致性巡检失败:', e) }
 }
 
 function computeSatisfaction(reserved = 0, total = 0) {
@@ -897,6 +928,9 @@ app.get('/api/state', (req, res) => {
     schedulingStats: schedulingStats(),
     coverageToday: coverageForDay(state.day()),
     dispatchPlan: dispatchPlan({ horizon: 3 }),
+    // 统一客流预测与资源调度闭环（统一预测 + 缺口画像 + 一致性巡检）
+    closedLoop: closedLoopOverview({ horizon: 3, demandProvider: d => demandForDay(d) }),
+    reconcileList: listFindings({ status: 'open', limit: 50 }),
     finance: fin,
     avgs: {
       satisfaction: computeSatisfaction(),
@@ -1464,6 +1498,28 @@ app.post('/api/dispatch/run', (req, res) => {
 app.get('/api/coverage/:day', (req, res) => {
   const day = num(req.params.day, state.day())
   res.json({ coverage: coverageForDay(day), demand: demandForDay(day) })
+})
+
+// ---- 统一客流预测与资源调度闭环 ----
+// 闭环总览（只读）：未来 3 天统一客流预测（散客/团队/会员 + 散客自适应外推）+ 班段需求画像 + 巡检统计
+app.get('/api/closed-loop', (req, res) => {
+  const horizon = Math.max(1, Math.min(7, num(req.query.horizon, 3)))
+  res.json({
+    overview: closedLoopOverview({ horizon, demandProvider: d => demandForDay(d) }),
+    findings: listFindings({ status: req.query.all === '1' ? 'all' : 'open', limit: 200 })
+  })
+})
+
+// 手动触发一致性巡检（库存计数器漂移自动自愈；资金类仅告警）
+app.post('/api/reconcile/run', (req, res) => {
+  const autoHeal = req.body?.auto_heal !== false
+  const r = runReconcile({ autoHeal, logEvent: true })
+  res.json({ ...r, reqId: req.reqId, findings: listFindings({ status: 'open', limit: 200 }) })
+})
+
+// 忽略一条巡检告警（人工已核对/确认无需处理）
+app.post('/api/reconcile/:id/ignore', (req, res) => {
+  res.json({ ...ignoreFinding(num(req.params.id)), reqId: req.reqId })
 })
 
 // ---- 分时预约：库存 / 下单 / 改签 / 取消 / 核销 ----

@@ -3,6 +3,7 @@ import {
   RESERVATION_CONST, ensureSlots,
   getSlotById, findGroupAltSlots
 } from './reservations.js'
+import { markFlowDirty } from './flow.js'
 
 // 领队组团模块：领队提交入园 + 多设施行程 → 运营确认统一锁定名额并收订金
 // → 分批核销 / 尾款结算 / 部分退团 → 设施停运时重排行程或退款，回写预约、客流与财务。
@@ -254,6 +255,8 @@ export function confirmGroup(id, { requestId = '', staffId = null } = {}) {
       db.prepare(`UPDATE group_orders SET status=?, deposit_amount=?, confirm_tick=? WHERE id=?`)
         .run(settled ? 'settled' : 'confirmed', deposit, ctx.tick(), id)
       logGroup(id, 'confirm', `运营确认锁定全部时段名额，收取订金 ¥${deposit}${settled ? '（已结清全款）' : ''}`, staffId)
+      // 闭环：团队名额锁定（散客/团共用库存）后刷新统一客流预测并重排
+      markFlowDirty('团队确认锁名额')
       return { ok: true, deposit, status: settled ? 'settled' : 'confirmed' }
     })
   })
@@ -447,6 +450,7 @@ function sliceItemRefund(item, n, reason, note) {
   db.prepare('INSERT INTO reservation_logs(reservation_id,tick,day,hour,action,note) VALUES(?,?,?,?,?,?)')
     .run(item.reservation_id, ctx.tick(), ctx.day(), ctx.hour(), 'refund',
       `团队 ${g.code} ${note}：${n} 人，释放名额并回退团款 ¥${back}`)
+  markFlowDirty('团队退团名额释放')
   maybeComplete(g.id)
   return { ok: true, back, fee, sliceAmount }
 }
@@ -537,6 +541,7 @@ function suspendInterruptedItem(g, item, rsv, remain, note) {
   db.prepare("UPDATE group_items SET status='interrupted', note=? WHERE id=?").run(note, item.id)
   db.prepare('INSERT INTO reservation_logs(reservation_id,tick,day,hour,action,note) VALUES(?,?,?,?,?,?)')
     .run(rsv.id, ctx.tick(), ctx.day(), ctx.hour(), 'refund', `团队 ${g.code} 设施停运，名额释放，团款待重排/退款决策`)
+  markFlowDirty('团队停运挂起释放名额')
 }
 
 // 重排到新时段：占用新名额 + 建立新团预约单（0 元）。
@@ -580,6 +585,7 @@ function rerouteToSlot(g, item, slot, remain, note, { releaseOld = true } = {}) 
   db.prepare('INSERT INTO reservation_logs(reservation_id,tick,day,hour,action,note) VALUES(?,?,?,?,?,?)')
     .run(rid, ctx.tick(), ctx.day(), ctx.hour(), 'auto_reschedule', `团队 ${g.code} 行程重排，新预约单 YY${String(rid).padStart(4, '0')}（${remain} 人）`)
   logGroup(g.id, 'reroute', `${note}；新预约单 YY${String(rid).padStart(4, '0')} 已锁定，已核销 ${item.checked_qty} 人不随改`)
+  markFlowDirty('团队行程重排名额转移')
   return rid
 }
 
@@ -649,6 +655,7 @@ export function refundInterruptedItem(itemId, { requestId = '' } = {}) {
         addPayment(g.id, 'refund_park', -back, '设施停运挂起行程，园方全额回退团款')
       }
       logGroup(g.id, 'refund', `停运行程领队选择退款：${remain} 人 · 应收冲减 ¥${sliceAmount} · 退领队 ¥${back}`)
+      markFlowDirty('团队挂起行程退款')
       maybeComplete(g.id)
       return { ok: true, back, sliceAmount }
     })
